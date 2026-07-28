@@ -34,6 +34,7 @@
   const HDR = { 'content-type': 'application/json', 'x-gacha-client': 'web' };
   // 索引器偶发 504（Indexer request timed out），自动退避重试
   const sleep = ms => new Promise(r => setTimeout(r, ms));
+  let onProgress = () => {};
   async function api(operation, variables = {}, tries = 4) {
     let lastErr = null;
     for (let i = 0; i < tries; i++) {
@@ -45,7 +46,7 @@
         if (j && j.data) return j;
         lastErr = (j && j.error) || ('HTTP ' + r.status);
       } catch (e) { lastErr = e.message; }
-      if (i < tries - 1) await sleep(600 * (i + 1));
+      if (i < tries - 1) { onProgress('索引器超时，重试中（' + (i + 2) + '/' + tries + '）…'); await sleep(600 * (i + 1)); }
     }
     throw new Error('索引器无响应（' + lastErr + '）。稍后重试。');
   }
@@ -77,12 +78,14 @@
 
     let items = [], after = cursor('99999999999999999999999999', '99999999'), pages = 0;
     while (pages++ < 60) {
+      onProgress('正在读取第 ' + pages + ' 页，已获取 ' + items.length + ' 个仓位…');
       const L = (await api('pool-prizes-page', { after }))?.data?.listings;
       if (!L) break;
       items = items.concat(L.items);
       if (!L.pageInfo.hasNextPage) break;
       after = L.pageInfo.endCursor;
     }
+    onProgress('正在计算…');
     const g1 = (await api('pool-public'))?.data?.gameState || g0;
 
     let gwei = null;
@@ -225,7 +228,7 @@
     table.t tr:last-child td{border-bottom:none}
     .dot{display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:6px}
     .g{color:#3fd68c}.b{color:#ff5c5c}.w{color:#ffb020}.d{color:#8b929e}.gd{color:#f5c451}
-    .chk{font-size:10.5px;padding:7px 9px;border-radius:7px;margin-bottom:10px;line-height:1.55}
+    .chk{font-size:10.5px;padding:7px 9px;border-radius:7px;margin-bottom:10px;line-height:1.55;background:#161920;border:1px solid #22262e;color:#8b929e}
     .ok{background:rgba(63,214,140,.09);border:1px solid rgba(63,214,140,.3);color:#a5e8c4}
     .no{background:rgba(255,92,92,.09);border:1px solid rgba(255,92,92,.32);color:#ffbdbd}
     .sec{font-size:9.5px;color:#5d646f;text-transform:uppercase;letter-spacing:.5px;margin:13px 0 6px}
@@ -244,7 +247,7 @@
   <div class="fT">
     <b data-t="0" class="on">概览</b><b data-t="1">连抽</b><b data-t="2">原理</b><b data-t="3">自检</b><b data-t="4">局限</b>
   </div>
-  <div class="fB" id="fBody">载入中…</div>`;
+  <div class="fB" id="fBody"><div class="chk">正在启动…</div></div>`;
   document.body.appendChild(el);
 
   const body = el.querySelector('#fBody');
@@ -433,16 +436,27 @@
   }
 
   /* ══════════════ 主循环 ══════════════ */
-  let last = 0;
+  let last = 0, busy = false;
   async function refresh() {
+    if (busy) return;
+    busy = true;
+    const t0 = Date.now();
+    // 首次载入时把进度显示在面板里；已有数据时只淡化，不覆盖
+    const showProgress = msg => {
+      const secs = ((Date.now() - t0) / 1000).toFixed(0);
+      if (!R) body.innerHTML = `<div class="chk">${msg}<br><span class="d">已用 ${secs} 秒。池子越大翻页越久，通常 10–60 秒。</span></div>`;
+      else el.querySelector('#fAge').textContent = msg;
+    };
+    onProgress = showProgress;
     try {
+      showProgress('正在连接索引器…');
       body.style.opacity = .45;
       const { g, g0, act, gwei } = await fetchAll();
       R = compute(g, act, g0, gwei);
       paint(); last = Date.now();
     } catch (e) {
       body.innerHTML = `<div class="chk no">取数失败：${e.message}<br>请确认当前页面在 www.fwa.fun 域名下。</div>`;
-    } finally { body.style.opacity = 1; }
+    } finally { body.style.opacity = 1; onProgress = () => {}; busy = false; }
   }
   el.querySelector('#fR').onclick = refresh;
   setInterval(() => { el.querySelector('#fAge').textContent = last ? Math.floor((Date.now() - last) / 1000) + 's 前' : ''; }, 1000);
