@@ -28,7 +28,7 @@ Five tabs:
 | **Overview** | True cost per pull, most likely return, chance of not losing, expected value, plus a seven-bucket outcome distribution and live protocol state |
 | **Multi-pull** | Monte Carlo curve of "chance of not losing" vs number of pulls, with the peak marked |
 | **Method** | Six-step derivation with the current live numbers substituted in, so you can check it by hand |
-| **Self-test** | Six identity checks re-run on every refresh, each showing PASS/FAIL and the numeric error |
+| **Self-test** | Ten identity checks re-run on every refresh, each showing PASS/FAIL and the numeric error — the last four reconcile the enumerated pool against the official totals digit for digit |
 | **Limits** | What this tool cannot tell you (read this one) |
 
 The panel is draggable, collapsible, and auto-refreshes every 60 seconds.
@@ -104,7 +104,7 @@ Research tool, not investment advice.
 | **概览** | 这一抽的真实花费、最可能拿回多少、不亏概率、每抽期望，外加七档结果分布和实时协议状态 |
 | **连抽** | 蒙特卡洛跑出的「不亏概率 vs 抽奖次数」曲线，峰值标金色 |
 | **原理** | 六步推导，每步代入当下的真实数字，你可以拿计算器复核 |
-| **自检** | 六项恒等式检验，每次刷新现场重跑，显示 PASS/FAIL 和数值误差 |
+| **自检** | 十项恒等式检验，每次刷新现场重跑，显示 PASS/FAIL 和数值误差——最后四项把枚举出的池子与官方合计逐位对拍 |
 | **局限** | 这个工具算不出来的东西（建议先读这页） |
 
 面板可拖动、可折叠，每 60 秒自动刷新。
