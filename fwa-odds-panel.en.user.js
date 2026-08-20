@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FWA Odds Panel
 // @namespace    fwa.monitor
-// @version      2.0
+// @version      3.0
 // @description  Live odds for fwa.fun: true cost per pull, full outcome distribution, and how many pulls is optimal. Same data source as the official UI, with built-in consistency checks.
 // @match        https://www.fwa.fun/*
 // @match        https://fwa.fun/*
@@ -15,9 +15,18 @@
  *       automatically whenever you open fwa.fun.
  *    B) One-off: on fwa.fun press F12 → Console → paste → Enter.
  *
+ *  What changed in 3.0
+ *    fwa.fun moved to server-side rendering in 2026-08. /api/ponder still exists but
+ *    now answers only a small whitelist (leaderboard, prize, ...), so the
+ *    pool-public / pool-prizes-page calls 2.0 relied on return
+ *    "Invalid Ponder operation request" and the panel could no longer fetch anything.
+ *    The pool data did not disappear — it moved into the page's own server-rendered
+ *    payload. 3.0 reads that instead, and the result is better than before.
+ *
  *  Why the numbers match fwa.fun exactly
- *    1. It calls the site's own /api/ponder and /api/rpc — same origin, same headers,
- *       same data source the official UI uses.
+ *    1. It reads the very payload the official UI renders from (the RSC data embedded
+ *       in the page). That is stronger than "same endpoint": it is the same snapshot.
+ *       Gas still comes from the site's own /api/rpc.
  *    2. Every protocol parameter (surcharge / settlement discount / hotGap / coldGap /
  *       whether acquisitions are enabled) is read live from gameState on each refresh.
  *       Nothing is hardcoded. If the owner changes a parameter, the panel follows.
@@ -25,7 +34,10 @@
  *    4. The ticket price is computed twice via two independent paths and cross-checked:
  *         Path A (contract view): weightedBackingTotal / totalActiveWeight × (1+surcharge)
  *         Path B (enumeration):   N / Σ(1/backing) × (1+surcharge)
- *       Agreement proves not one of the 5000+ listings was missed. Disagreement → red alert.
+ *       Agreement proves not one of the 6000+ listings was missed. Disagreement → red alert.
+ *    5. New in 3.0: four digit-exact reconciliations — the enumerated Σweight and
+ *       Σbacking must equal the gameState totals as exact BigInt equalities, and every
+ *       weight must equal exactly 1e36 ÷ backing.
  *
  *  Known limitations that code cannot fix are listed in the panel's "Limits" tab.
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -35,31 +47,65 @@
 
   const E = 1e18;
   const HDR = { 'content-type': 'application/json', 'x-gacha-client': 'web' };
-  // The indexer intermittently returns 504 (Indexer request timed out) — retry with backoff
-  const sleep = ms => new Promise(r => setTimeout(r, ms));
   let onProgress = () => {};
-  async function api(operation, variables = {}, tries = 4) {
-    let lastErr = null;
-    for (let i = 0; i < tries; i++) {
-      try {
-        const r = await fetch('/api/ponder', {
-          method: 'POST', headers: HDR, body: JSON.stringify({ operation, variables })
-        });
-        const j = await r.json();
-        if (j && j.data) return j;
-        lastErr = (j && j.error) || ('HTTP ' + r.status);
-      } catch (e) { lastErr = e.message; }
-      if (i < tries - 1) { onProgress('Indexer timed out, retrying (' + (i + 2) + '/' + tries + ')…'); await sleep(600 * (i + 1)); }
-    }
-    throw new Error('Indexer unavailable (' + lastErr + '). Try again shortly.');
-  }
+
   const rpc = (method, params = []) =>
     fetch('/api/rpc', { method: 'POST', headers: HDR, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }) })
       .then(r => r.json());
-  const cursor = (b, i) => btoa(JSON.stringify({
-    json: { backing: String(b), id: String(i) },
-    meta: { values: { backing: ['bigint'], id: ['bigint'] }, v: 1 }
-  }));
+  /* ── Data source: the page's own server-rendered payload ─────────────────
+     fwa.fun moved to server-side rendering in 2026-08. /api/ponder still exists but
+     now answers only a small whitelist of operations (leaderboard, prize, ...), so
+     the old pool-public / pool-prizes-page calls all return
+     "Invalid Ponder operation request".
+
+     The pool data did not disappear — it moved into the page's own RSC flight
+     payload: the homepage embeds the complete gameState plus every active listing
+     (id / weight / backing / activatedAt / allocatedAt / resolvedAt).
+
+     This is strictly better than the old pagination:
+       · one request instead of up to 60, seconds instead of tens of seconds;
+       · gameState and listings come from ONE server render, so the "pool shifted
+         while we were paginating" race is gone — the listing-count check is now an
+         exact equality rather than a tolerance;
+       · still nothing hardcoded, which matters more than ever: the owner has since
+         changed the parameters (surcharge 1000 → 250 bps, settlement discount
+         8500 → 9000 bps).                                                      */
+  function flightRaw(html) {
+    let raw = '';
+    const re = /self\.__next_f\.push\(\[\d+,("(?:[^"\\]|\\.)*")\]\)/g;
+    let m;
+    while ((m = re.exec(html))) { try { raw += JSON.parse(m[1]); } catch (e) {} }
+    return raw;
+  }
+  function flightFromDOM() {
+    let html = '';
+    for (const s of document.querySelectorAll('script')) {
+      const t = s.textContent || '';
+      if (t.indexOf('__next_f.push') !== -1) html += t;
+    }
+    return flightRaw(html);
+  }
+  // Bracket-match out "key":{…} or "key":[…]. A key can occur more than once, so try
+  // each candidate until one parses.
+  function grabJSON(raw, key, open, close) {
+    let k = -1;
+    while ((k = raw.indexOf('"' + key + '"', k + 1)) !== -1) {
+      const st = raw.indexOf(open, k);
+      if (st < 0 || st - k > 40) continue;
+      let d = 0;
+      for (let e = st; e < raw.length; e++) {
+        const c = raw[e];
+        if (c === open) d++;
+        else if (c === close) {
+          if (--d === 0) {
+            try { return JSON.parse(raw.slice(st, e + 1)); } catch (err) { break; }
+          }
+        }
+      }
+    }
+    return null;
+  }
+
   const F = (x, d = 4) => (x == null || !isFinite(x)) ? '—' : (+x).toFixed(d);
   const PCT = x => (x * 100).toFixed(2) + '%';
 
@@ -74,29 +120,35 @@
   ];
 
   /* ══════════════ FETCH ══════════════ */
+  let usedDOM = false;
   async function fetchAll() {
-    // Enumeration takes seconds and the pool shifts meanwhile. Read gameState before and after,
-    // then use that range to tell a normal race condition apart from a real error.
-    const g0 = (await api('pool-public'))?.data?.gameState;
-    if (!g0) throw new Error('Cannot reach gameState (are you on the fwa.fun domain?)');
-
-    let items = [], after = cursor('99999999999999999999999999', '99999999'), pages = 0;
-    while (pages++ < 60) {
-      onProgress('Fetching page ' + pages + ', ' + items.length + ' listings so far…');
-      const L = (await api('pool-prizes-page', { after }))?.data?.listings;
-      if (!L) break;
-      items = items.concat(L.items);
-      if (!L.pageInfo.hasNextPage) break;
-      after = L.pageInfo.endCursor;
+    // First render uses the payload already in the page (zero requests). Every refresh
+    // after that re-fetches the homepage, so the pool stays current without a reload.
+    let raw = null, gs = null, ls = null;
+    if (!usedDOM) {
+      onProgress('Reading page data…');
+      raw = flightFromDOM();
+      gs = grabJSON(raw, 'gameState', '{', '}');
+      ls = grabJSON(raw, 'listings', '[', ']');
+      if (gs && ls && ls.length) usedDOM = true;
     }
-    onProgress('Computing…');
-    const g1 = (await api('pool-public'))?.data?.gameState || g0;
+    if (!gs || !ls || !ls.length) {
+      onProgress('Requesting the latest pool from fwa.fun…');
+      const html = await fetch('/', { cache: 'no-store', credentials: 'same-origin' }).then(r => r.text());
+      raw = flightRaw(html);
+      gs = grabJSON(raw, 'gameState', '{', '}');
+      ls = grabJSON(raw, 'listings', '[', ']');
+    }
+    if (!gs) throw new Error('gameState not found in the page (are you on the fwa.fun domain?)');
+    if (!ls || !ls.length) throw new Error('Listing array not found in the page — the site structure may have changed again');
 
+    onProgress('Computing…');
     let gwei = null;
     try { const r = await rpc('eth_gasPrice'); if (r.result) gwei = parseInt(r.result, 16) / 1e9; } catch (e) {}
 
-    const act = items.filter(x => x.activatedAt && !x.allocatedAt && !x.resolvedAt);
-    return { g: g1, g0, act, pages, gwei };
+    const act = ls.filter(x => x.activatedAt && !x.allocatedAt && !x.resolvedAt);
+    // gameState and listings come from one render, so "before" and "after" are the same snapshot
+    return { g: gs, g0: gs, act, pages: 1, gwei };
   }
 
   /* ══════════════ COMPUTE ══════════════ */
@@ -160,7 +212,8 @@
       refundRate, enabled: g.acquisitionsEnabled,
       totalBacking: Number(g.totalActiveBacking) / E, topPot: Number(g.topListingPot) / E,
       totalAcq: Number(g.totalAcquisitions), feeVolume: Number(g.totalAcquisitionFeeVolume) / E,
-      p, got, b };
+      p, got, b,
+      raw: act, gTotalWeight: g.totalActiveWeight, gTotalBacking: g.totalActiveBacking };
   }
 
   /* ══════════════ MULTI-PULL CURVE ══════════════
@@ -200,6 +253,25 @@
       while (lo < hi) { const m = (lo + hi) >> 1; if (cum[m] < u) lo = m + 1; else hi = m; }
       tot += r.got[lo]; }
     add('Monte Carlo 150k runs vs analytic expectation', r.ev, tot / R, r.ev * 0.02);
+
+    // The four below reconcile the enumerated pool against the official gameState
+    // totals, digit for digit. If even one listing were missed or misread the
+    // difference would be non-zero — direct proof that nothing was dropped.
+    if (r.raw && r.gTotalWeight != null) {
+      try {
+        const B = x => BigInt(x);
+        let sw = 0n, sb = 0n, wOK = 0;
+        for (const l of r.raw) {
+          const w = B(l.weight), b = B(l.backing);
+          sw += w; sb += b;
+          if (w === (10n ** 36n) / b) wOK++;
+        }
+        add('Listing count = activeListingCount', Number(r.nB), r.raw.length, 0);
+        add('Σweight = totalActiveWeight (exact)', 0, Number(sw - B(r.gTotalWeight)), 0);
+        add('Σbacking = totalActiveBacking (exact)', 0, Number(sb - B(r.gTotalBacking)), 0);
+        add('Every weight = 1e36 ÷ backing', r.raw.length, wOK, 0);
+      } catch (e) { /* If the site changes field types, skip these rather than break the tab */ }
+    }
     return T;
   }
 
@@ -461,7 +533,7 @@
     // On first load show progress inside the panel; once data exists, just dim instead of wiping it
     const showProgress = msg => {
       const secs = ((Date.now() - t0) / 1000).toFixed(0);
-      if (!R) body.innerHTML = `<div class="chk">${msg}<br><span class="d">${secs}s elapsed. Larger pools take longer to page through — typically 10–60s.</span></div>`;
+      if (!R) body.innerHTML = `<div class="chk">${msg}<br><span class="d">${secs}s elapsed.</span></div>`;
       else el.querySelector('#fAge').textContent = msg;
     };
     onProgress = showProgress;
