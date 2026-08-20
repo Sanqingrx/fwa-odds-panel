@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FWA 抽奖赔率实时面板
 // @namespace    fwa.monitor
-// @version      2.0
+// @version      3.0
 // @description  在 fwa.fun 页面内实时计算：抽一次的真实花费、结果概率分布、连抽几次最划算。数据源与官方 UI 完全相同，自带一致性校验。
 // @match        https://www.fwa.fun/*
 // @match        https://fwa.fun/*
@@ -14,15 +14,24 @@
  *    A) Tampermonkey → 新建脚本 → 粘贴本文件 → 保存。以后打开 fwa.fun 自动出现。
  *    B) 临时用：在 fwa.fun 页面按 F12 → Console → 粘贴 → 回车。
  *
+ *  3.0 改了什么
+ *    fwa.fun 在 2026-08 改成服务端渲染。/api/ponder 还在，但只回应一个很小的白名单
+ *    （leaderboard、prize 之类），2.0 用的 pool-public / pool-prizes-page 一律返回
+ *    "Invalid Ponder operation request"，面板因此抓不到数据。池子数据并没有消失，
+ *    只是搬进了页面本身的服务端渲染负载。3.0 改读那份负载，结果比原来更好。
+ *
  *  为什么数据一定和 fwa 一致
- *    1. 走站点自己的 /api/ponder 与 /api/rpc，与官方 UI 同源、同 header、同数据源。
+ *    1. 读的就是官方 UI 自己渲染用的那份数据（页面内嵌的 RSC 负载），比「同一个接口」
+ *       更进一步：是同一份快照。gas 仍走站点自己的 /api/rpc。
  *    2. 所有协议参数（surcharge / 回售折价 / hotGap / coldGap / 是否开放抽奖）
  *       每次刷新从 gameState 实时读，代码里不写死。owner 改参数，面板跟着变。
  *    3. Gas 价格从链上实时读，不靠估。
  *    4. 票价用两条互不相干的路径各算一次并交叉比对：
  *         路径①（合约口径）weightedBackingTotal / totalActiveWeight × (1+surcharge)
  *         路径②（枚举口径）N / Σ(1/backing) × (1+surcharge)
- *       一致 → 证明 5000+ 仓位一条没漏。不一致 → 红色告警。
+ *       一致 → 证明 6000+ 仓位一条没漏。不一致 → 红色告警。
+ *    5. 3.0 新增四项逐位对拍：枚举出的 Σweight 与 Σbacking 必须与 gameState 的官方
+ *       合计 BigInt 精确相等，且每个 weight 必须恰好等于 1e36 ÷ backing。
  *
  *  已知的、代码解决不了的局限，见面板「局限」页签。
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -32,31 +41,61 @@
 
   const E = 1e18;
   const HDR = { 'content-type': 'application/json', 'x-gacha-client': 'web' };
-  // 索引器偶发 504（Indexer request timed out），自动退避重试
-  const sleep = ms => new Promise(r => setTimeout(r, ms));
   let onProgress = () => {};
-  async function api(operation, variables = {}, tries = 4) {
-    let lastErr = null;
-    for (let i = 0; i < tries; i++) {
-      try {
-        const r = await fetch('/api/ponder', {
-          method: 'POST', headers: HDR, body: JSON.stringify({ operation, variables })
-        });
-        const j = await r.json();
-        if (j && j.data) return j;
-        lastErr = (j && j.error) || ('HTTP ' + r.status);
-      } catch (e) { lastErr = e.message; }
-      if (i < tries - 1) { onProgress('索引器超时，重试中（' + (i + 2) + '/' + tries + '）…'); await sleep(600 * (i + 1)); }
-    }
-    throw new Error('索引器无响应（' + lastErr + '）。稍后重试。');
-  }
+
   const rpc = (method, params = []) =>
     fetch('/api/rpc', { method: 'POST', headers: HDR, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }) })
       .then(r => r.json());
-  const cursor = (b, i) => btoa(JSON.stringify({
-    json: { backing: String(b), id: String(i) },
-    meta: { values: { backing: ['bigint'], id: ['bigint'] }, v: 1 }
-  }));
+  /* ── 数据源：页面自带的服务端渲染负载 ───────────────────────────────────
+     fwa.fun 在 2026-08 改成了服务端渲染。/api/ponder 仍然存在，但只回应一个很小的
+     白名单（leaderboard、prize 之类），旧的 pool-public / pool-prizes-page 一律返回
+     "Invalid Ponder operation request"。
+
+     池子数据没有消失，只是搬进了页面本身的 RSC flight 负载：首页内嵌了完整的
+     gameState 和全部活跃仓位（id / weight / backing / activatedAt / allocatedAt /
+     resolvedAt）。
+
+     这比原来的翻页严格更好：
+       · 一次请求拿到全部，秒级完成，不再翻最多 60 页；
+       · gameState 与 listings 出自同一次服务端渲染，「翻页期间池子变了」的竞态
+         从此消失——仓位数检验由「容忍偏差」变成「精确相等」；
+       · 依然没有任何硬编码。这一点比以往更重要：站方此后确实改过参数
+         （surcharge 1000→250 bps，回售折价 8500→9000 bps）。               */
+  function flightRaw(html) {
+    let raw = '';
+    const re = /self\.__next_f\.push\(\[\d+,("(?:[^"\\]|\\.)*")\]\)/g;
+    let m;
+    while ((m = re.exec(html))) { try { raw += JSON.parse(m[1]); } catch (e) {} }
+    return raw;
+  }
+  function flightFromDOM() {
+    let html = '';
+    for (const s of document.querySelectorAll('script')) {
+      const t = s.textContent || '';
+      if (t.indexOf('__next_f.push') !== -1) html += t;
+    }
+    return flightRaw(html);
+  }
+  // 按括号配对切出 "key":{…} 或 "key":[…]。同一个 key 可能出现多次，逐个候选试到能解析为止。
+  function grabJSON(raw, key, open, close) {
+    let k = -1;
+    while ((k = raw.indexOf('"' + key + '"', k + 1)) !== -1) {
+      const st = raw.indexOf(open, k);
+      if (st < 0 || st - k > 40) continue;
+      let d = 0;
+      for (let e = st; e < raw.length; e++) {
+        const c = raw[e];
+        if (c === open) d++;
+        else if (c === close) {
+          if (--d === 0) {
+            try { return JSON.parse(raw.slice(st, e + 1)); } catch (err) { break; }
+          }
+        }
+      }
+    }
+    return null;
+  }
+
   const F = (x, d = 4) => (x == null || !isFinite(x)) ? '—' : (+x).toFixed(d);
   const PCT = x => (x * 100).toFixed(2) + '%';
 
@@ -71,28 +110,35 @@
   ];
 
   /* ══════════════ 取数 ══════════════ */
+  let usedDOM = false;
   async function fetchAll() {
-    // 枚举要几秒，期间池子会变。前后各读一次 gameState，用区间区分「正常竞态」与「真错误」
-    const g0 = (await api('pool-public'))?.data?.gameState;
-    if (!g0) throw new Error('拿不到 gameState（是否不在 fwa.fun 域名下？）');
-
-    let items = [], after = cursor('99999999999999999999999999', '99999999'), pages = 0;
-    while (pages++ < 60) {
-      onProgress('正在读取第 ' + pages + ' 页，已获取 ' + items.length + ' 个仓位…');
-      const L = (await api('pool-prizes-page', { after }))?.data?.listings;
-      if (!L) break;
-      items = items.concat(L.items);
-      if (!L.pageInfo.hasNextPage) break;
-      after = L.pageInfo.endCursor;
+    // 首次渲染直接用页面里已有的负载（零请求）；之后每次刷新重新拉一份首页，
+    // 这样不重载页面也能拿到最新池子。
+    let raw = null, gs = null, ls = null;
+    if (!usedDOM) {
+      onProgress('正在读取页面数据…');
+      raw = flightFromDOM();
+      gs = grabJSON(raw, 'gameState', '{', '}');
+      ls = grabJSON(raw, 'listings', '[', ']');
+      if (gs && ls && ls.length) usedDOM = true;
     }
-    onProgress('正在计算…');
-    const g1 = (await api('pool-public'))?.data?.gameState || g0;
+    if (!gs || !ls || !ls.length) {
+      onProgress('正在向 fwa.fun 请求最新池子…');
+      const html = await fetch('/', { cache: 'no-store', credentials: 'same-origin' }).then(r => r.text());
+      raw = flightRaw(html);
+      gs = grabJSON(raw, 'gameState', '{', '}');
+      ls = grabJSON(raw, 'listings', '[', ']');
+    }
+    if (!gs) throw new Error('页面里找不到 gameState（当前是否在 fwa.fun 域名下？）');
+    if (!ls || !ls.length) throw new Error('页面里找不到仓位列表，站点结构可能又变了');
 
+    onProgress('正在计算…');
     let gwei = null;
     try { const r = await rpc('eth_gasPrice'); if (r.result) gwei = parseInt(r.result, 16) / 1e9; } catch (e) {}
 
-    const act = items.filter(x => x.activatedAt && !x.allocatedAt && !x.resolvedAt);
-    return { g: g1, g0, act, pages, gwei };
+    const act = ls.filter(x => x.activatedAt && !x.allocatedAt && !x.resolvedAt);
+    // gameState 与 listings 出自同一次渲染，所以「取数前」「取数后」就是同一份快照
+    return { g: gs, g0: gs, act, pages: 1, gwei };
   }
 
   /* ══════════════ 计算 ══════════════ */
@@ -156,7 +202,8 @@
       refundRate, enabled: g.acquisitionsEnabled,
       totalBacking: Number(g.totalActiveBacking) / E, topPot: Number(g.topListingPot) / E,
       totalAcq: Number(g.totalAcquisitions), feeVolume: Number(g.totalAcquisitionFeeVolume) / E,
-      p, got, b };
+      p, got, b,
+      raw: act, gTotalWeight: g.totalActiveWeight, gTotalBacking: g.totalActiveBacking };
   }
 
   /* ══════════════ 连抽曲线 ══════════════
@@ -195,6 +242,24 @@
       while (lo < hi) { const m = (lo + hi) >> 1; if (cum[m] < u) lo = m + 1; else hi = m; }
       tot += r.got[lo]; }
     add('蒙特卡洛 15 万次 vs 解析期望', r.ev, tot / R, r.ev * 0.02);
+
+    // 下面四项把面板枚举出来的池子与 gameState 的官方合计逐位对拍。
+    // 只要有一条仓位漏掉或读错，差值立刻非零——这是「一条没漏」的直接证明。
+    if (r.raw && r.gTotalWeight != null) {
+      try {
+        const B = x => BigInt(x);
+        let sw = 0n, sb = 0n, wOK = 0;
+        for (const l of r.raw) {
+          const w = B(l.weight), b = B(l.backing);
+          sw += w; sb += b;
+          if (w === (10n ** 36n) / b) wOK++;
+        }
+        add('仓位数 = activeListingCount', Number(r.nB), r.raw.length, 0);
+        add('Σweight = totalActiveWeight（逐位）', 0, Number(sw - B(r.gTotalWeight)), 0);
+        add('Σbacking = totalActiveBacking（逐位）', 0, Number(sb - B(r.gTotalBacking)), 0);
+        add('每个 weight = 1e36 ÷ backing', r.raw.length, wOK, 0);
+      } catch (e) { /* 站点若改了字段类型，跳过这四项而不是整页报错 */ }
+    }
     return T;
   }
 
@@ -444,7 +509,7 @@
     // 首次载入时把进度显示在面板里；已有数据时只淡化，不覆盖
     const showProgress = msg => {
       const secs = ((Date.now() - t0) / 1000).toFixed(0);
-      if (!R) body.innerHTML = `<div class="chk">${msg}<br><span class="d">已用 ${secs} 秒。池子越大翻页越久，通常 10–60 秒。</span></div>`;
+      if (!R) body.innerHTML = `<div class="chk">${msg}<br><span class="d">已用 ${secs} 秒。</span></div>`;
       else el.querySelector('#fAge').textContent = msg;
     };
     onProgress = showProgress;
