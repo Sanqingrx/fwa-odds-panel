@@ -1,167 +1,179 @@
 # FWA Odds Panel
 
-A userscript that computes live odds for [fwa.fun](https://www.fwa.fun) inside the page itself: the true all-in cost of one pull, the full outcome distribution, and how many pulls is actually optimal.
+A userscript that computes live odds for **fwa.fun V2** inside the page: what one pull really costs, which outcome tier it lands in and how likely each tier is, your chance of not losing, and what a run of pulls adds up to.
 
-It reads the page's own server-rendered payload — the same data the official UI renders from — so the numbers match by construction. It cross-checks the ticket price via two independent paths and shows a red warning if they disagree.
+The whole pool is read listing by listing from the FWAV2 contract and reconciled **exactly** against the contract's own totals before any distribution is shown.
 
-**[English](#english) · [中文](#中文)**
+[English](#english) · [中文](#中文)
 
 ---
 
-<a name="english"></a>
 ## English
 
 ### Install
 
-**Tampermonkey (recommended)** — install [Tampermonkey](https://www.tampermonkey.net/), then Dashboard → **+** (new script) → paste the contents of **[`fwa-odds-panel.en.user.js`](fwa-odds-panel.en.user.js)** → Ctrl+S. The panel appears automatically whenever you open fwa.fun.
+**Tampermonkey (recommended)** — install Tampermonkey, then Dashboard → **+** (new script) → paste the contents of `fwa-odds-panel.en.user.js` → Ctrl+S. The panel appears whenever you open fwa.fun.
 
 **One-off** — on fwa.fun press F12 → Console → paste the same file → Enter.
 
-> Chinese speakers: use [`fwa-odds-panel.zh.user.js`](fwa-odds-panel.zh.user.js) instead. The two files are functionally identical; only the interface language differs.
+Chinese interface: use `fwa-odds-panel.zh.user.js`. Both files are built from the same source in `src/` and differ only in language.
 
 ### What it shows
 
-Five tabs:
-
 | Tab | Contents |
-|---|---|
-| **Overview** | True cost per pull, most likely return, chance of not losing, expected value, plus a seven-bucket outcome distribution and live protocol state |
-| **Multi-pull** | Monte Carlo curve of "chance of not losing" vs number of pulls, with the peak marked |
-| **Method** | Six-step derivation with the current live numbers substituted in, so you can check it by hand |
-| **Self-test** | Ten identity checks re-run on every refresh, each showing PASS/FAIL and the numeric error — the last four reconcile the enumerated pool against the official totals digit for digit |
-| **Limits** | What this tool cannot tell you (read this one) |
+| --- | --- |
+| **Overview** | Ticket (the contract's own quote), all-in cost, ETH vs FWA settlement side by side: RTP, chance of not losing, median return, expected net |
+| **Tiers** | Seven outcome tiers (wipeout → jackpot) with probability bars, listing counts and return ranges; 10/50/90% return quantiles; odds of ≥2×, ≥5×, ≥10× |
+| **Multi-pull** | 10,000-run Monte Carlo on the real pool for 1–100 pulls: chance of not losing, median net, 90% range |
+| **Method** | Derivation with live numbers, how the pool is read, why the distribution can be trusted |
+| **Self-test** | 18 checks re-run on every refresh, each with PASS/FAIL and the numbers behind it |
+| **Limits** | What this tool cannot tell you |
 
-The panel is draggable, collapsible, and auto-refreshes every 60 seconds.
+Tiers and multi-pull have an ETH / FWA switch. Draggable, collapsible, refreshes every 60 s.
 
-### Why the numbers match fwa.fun
+### How the pool is read
 
-1. **Same data source.** It reads the very payload the official UI renders from — the RSC data the page already embeds. That is stronger than "same endpoint": it is the same snapshot. Gas still comes from the site's own `/api/rpc`.
-2. **Nothing hardcoded.** Every protocol parameter (surcharge, settlement discount, `hotGap`, `coldGap`, whether acquisitions are enabled) is read live from `gameState` on each refresh. If the owner changes a parameter, the panel follows.
-3. **Live gas.** Gas price comes from `eth_gasPrice`, not an estimate.
-4. **Dual-path cross-check.** The ticket price is computed twice by unrelated routes:
-
-   ```
-   Path A (contract view):  weightedBackingTotal / totalActiveWeight × (1 + surcharge)
-   Path B (enumeration):    N / Σ(1/backing)                        × (1 + surcharge)
-   ```
-
-   Agreement proves not one of the 6000+ listings was missed. Disagreement triggers a red alert. In testing the drift is consistently 0.0000%. Since v3.0 the panel also reconciles digit for digit: the enumerated Σweight and Σbacking must equal the `gameState` totals as exact BigInt equalities, the listing count must equal `activeListingCount`, and every weight must equal exactly `1e36 / backing`.
-
-### The core finding
-
-Expected return is a fixed identity, not a variable:
+The site has no endpoint that lists the pool (that is why v4.0 dropped the distribution). v5.0 reads the contract directly:
 
 ```
-ticket price = expected backing × (1 + surcharge)
-sell-back    = backing × settlementDiscount
-               settlementDiscount / (1 + surcharge)
+slotToListing(slot) → listingId     public mapping; slots start at 1 and are reused, so the range has holes
+listings(id)        → weight, value (backing), status
 ```
 
-This holds regardless of pool size, pool composition, or when you pull — but **not** regardless of the two parameters, which the owner can change and has. At launch the pair was 1000 / 8500 bps, giving 0.85 / 1.10 = **77.3%**. As of 2026-08 it is 250 / 9000 bps, giving 0.90 / 1.025 = **87.8%**. The panel reads both live on every refresh and hardcodes neither, so the figure it shows is the current one. The only paths above it are keeping an NFT whose floor exceeds its backing and the cold-start FWA credit — both still short of break-even at the present settings.
+Calls are batched through Multicall3 over the site's own `/api/rpc`, all pinned to **one block**. The first load walks every slot (about 25–40 s); after that the panel re-reads only the known ids plus newly created ones (about 5–10 s), and falls back to a full scan if that does not reconcile. Known ids are cached in `localStorage`.
 
-The "Multi-pull" tab surfaces a less obvious result: the chance of *not losing* peaks at around 3 pulls, then declines monotonically. Optimal means **most uncertain**, not profitable.
+### Why the numbers can be trusted
+
+Every enumeration has to pass three exact BigInt checks against the contract at the same block:
+
+```
+listings read      == activeListingCount
+Σ weight           == totalWeight
+Σ weight × backing == weightedBackingTotal      (the contract's _evOf = w·v)
+```
+
+If even one listing were missed or misread, the three could not all hold. If they don't, the Tiers tab says so and shows nothing.
+
+The ticket is `quoteAcquisitionPrice().total`, read from the contract — exactly what `acquire()` charges. The panel also recomputes it two other ways (from the aggregates and from the enumerated pool) and checks all three agree.
+
+### The core identity
+
+```
+ticket = expected backing × (1 + surcharge)        expected backing = Σ(w·b)/Σw = harmonic mean
+payout = backing × buyback rate                     (FWAV2._settleBackingToPurchaser)
+RTP    = buyback rate ÷ (1 + surcharge)
+```
+
+RTP does not depend on pool size, composition or timing. It depends only on the parameters, which the owner can change — the panel reads them live from the contract. At the time of writing (2026-10-08): surcharge 5%, ETH buyback 90% → RTP **85.71%**, FWA buyback 91.5% → RTP **87.14%**.
+
+What *does* depend on the pool is the **shape**: with inverse weights, small listings are drawn far more often, so the median pull returns well under the ticket while a thin tail of large listings carries the expectation. Measured on the live pool: chance of not losing ≈ 26%, median return ≈ 0.75× cost.
+
+### Changes in v5.0
+
+- **Tier distribution is back**, computed from the full on-chain pool with exact reconciliation.
+- **Multi-pull Monte Carlo is back** (v4.0 could only list expected values).
+- **Ticket = contract quote.** v4.0 added an estimated self-paid VRF gas (800k × 1.3). In V2 the VRF cost is the on-chain `vrfServiceFee`, already inside the quote, so v4.0 over-counted.
+- **Gas calibrated on mainnet**: purchase averages 610k gas over 76 recent single-pull txs; settling to ETH ~175k, to FWA ~300k.
+- **On-chain parameters take precedence** over the indexer; a self-test flags any lag between the two.
 
 ### Limitations
 
-The panel's own **Limits** tab spells these out at runtime with live numbers. In short:
+The Limits tab lists these with live numbers. In short: keeping the NFT is not modelled (no reliable floor price); the FWA route is valued at the ETH spent, before swap slippage; the pool can change between purchase and selection; gas is an estimate; refunds are not amortised; rewards (top-listing pot, epoch $FWA, builder rewards) are excluded, so the panel is conservative; purchases pause daily 11:45–12:00 and 23:45–24:00 UTC.
 
-- **I have not read the contract source.** The formulas come from the prose and technical notes in the official docs, not a line-by-line reading of the Solidity. The dual-path cross-check does confirm that weighting and pricing match the live implementation, but that is not the same as auditing the code.
-- **No floor-price feed.** "Return" uses the sell-back bid, a lower bound. If you keep the NFT instead, note that a floor is an ask, not a fill.
-- **Refund risk is not amortised** into expected value. The live rate is read from `gameState` on every refresh — 3.8% across 151k pulls as of 2026-08 — and the VRF service fee is not returned on those.
-- **Two gas figures are estimates** (purchase and settlement). The VRF 800k × 1.3 comes from the docs but the owner can change it.
-- **The daily $FWA purchaser pot is excluded** — hard to price while external buys are disabled. This is the one omission that makes the panel conservative.
-- **Multi-pull assumes i.i.d. draws.** Valid at current pool size; breaks down if the pool shrinks to a few hundred listings.
+### Build
 
-For a given pool snapshot, every probability and amount on the Overview tab is an exact analytic solution, not an approximation. The uncertainty lives in the items above, not in the maths.
+```
+node src/build.mjs
+```
+
+writes `fwa-odds-panel.zh.user.js` and `fwa-odds-panel.en.user.js` from `src/panel.js` and `src/strings.{zh,en}.js`.
 
 ### Notes
 
-Reads only. The script never requests wallet access, signs anything, or sends data anywhere. It runs entirely in your browser.
-
-If fwa.fun restructures its page again, the panel reports "listing array not found" outright rather than quietly showing wrong numbers.
-
-Research tool, not investment advice.
+**Read-only.** No wallet access, no signing, no data sent anywhere except fwa.fun's own endpoints. Research tool, not investment advice.
 
 ---
 
-<a name="中文"></a>
 ## 中文
 
 ### 安装
 
-**油猴（推荐）**——装好 [Tampermonkey](https://www.tampermonkey.net/)，打开管理面板 → **+**（新建脚本）→ 粘贴 **[`fwa-odds-panel.zh.user.js`](fwa-odds-panel.zh.user.js)** 的全部内容 → Ctrl+S。之后每次打开 fwa.fun，面板自动出现。
+**油猴（推荐）** —— 装好 Tampermonkey，打开管理面板 → **+**（新建脚本）→ 粘贴 `fwa-odds-panel.zh.user.js` 的全部内容 → Ctrl+S。之后每次打开 fwa.fun，面板自动出现。
 
-**临时用**——在 fwa.fun 页面按 F12 → Console → 粘贴同一个文件 → 回车。
+**临时用** —— 在 fwa.fun 页面按 F12 → Console → 粘贴同一个文件 → 回车。
 
-> 要英文界面就用 [`fwa-odds-panel.en.user.js`](fwa-odds-panel.en.user.js)。两个文件功能完全一致，只有界面语言不同。
+要英文界面就用 `fwa-odds-panel.en.user.js`。两个文件由 `src/` 里同一份源码生成，只有界面语言不同。
 
 ### 面板内容
 
-五个页签：
-
 | 页签 | 内容 |
-|---|---|
-| **概览** | 这一抽的真实花费、最可能拿回多少、不亏概率、每抽期望，外加七档结果分布和实时协议状态 |
-| **连抽** | 蒙特卡洛跑出的「不亏概率 vs 抽奖次数」曲线，峰值标金色 |
-| **原理** | 六步推导，每步代入当下的真实数字，你可以拿计算器复核 |
-| **自检** | 十项恒等式检验，每次刷新现场重跑，显示 PASS/FAIL 和数值误差——最后四项把枚举出的池子与官方合计逐位对拍 |
-| **局限** | 这个工具算不出来的东西（建议先读这页） |
+| --- | --- |
+| **概览** | 票价（合约报价）、全部花费，拿 ETH 和拿 FWA 两种结算并排对比：RTP、不亏概率、中位数拿回、期望净值 |
+| **档位分布** | 七档结果（血亏 → 大奖）的概率条形图、各档仓位数和拿回区间；10% / 50% / 90% 落点；拿回 ≥2×、≥5×、≥10× 的概率 |
+| **连抽** | 基于真实全池的 1 万轮蒙特卡洛，1–100 连抽的不亏概率、中位净值、90% 区间 |
+| **原理** | 代入实时数字的推导、全池怎么读、分布为什么可信 |
+| **自检** | 18 项检验，每次刷新现场重跑，显示 PASS/FAIL 和对应数字 |
+| **局限** | 这个工具算不出来的东西 |
 
-面板可拖动、可折叠，每 60 秒自动刷新。
+档位分布和连抽可切换 ETH / FWA 口径。面板可拖动、可折叠，每 60 秒自动刷新。
 
-### 为什么数据一定和 fwa.fun 一致
+### 全池是怎么拿到的
 
-1. **同一个数据源。**读的就是官方 UI 自己渲染用的那份数据（页面内嵌的 RSC 负载）。这比「同一个接口」更进一步：是同一份快照。gas 仍走站点自己的 `/api/rpc`。
-2. **没有硬编码。**所有协议参数（surcharge、回售折价、`hotGap`、`coldGap`、是否开放抽奖）每次刷新都从 `gameState` 实时读取。owner 改参数，面板跟着变。
-3. **Gas 实时读。**取自 `eth_gasPrice`，不靠估算。
-4. **双路径交叉验证。**票价用两条互不相干的路径各算一次：
-
-   ```
-   路径 A（合约口径）：weightedBackingTotal / totalActiveWeight × (1 + surcharge)
-   路径 B（枚举口径）：N / Σ(1/backing)                        × (1 + surcharge)
-   ```
-
-   两者一致，就证明 6000 多个仓位一条没漏；不一致则红色告警。实测偏差稳定在 0.0000%。v3.0 起还会**逐位对拍**：枚举出的 Σweight 与 Σbacking 必须与 `gameState` 的官方合计 BigInt 精确相等，仓位数必须等于 `activeListingCount`，且每个 weight 必须恰好等于 `1e36 ÷ backing`。
-
-### 核心结论
-
-期望回报是个恒等式，不是变量：
+网站没有列出全池的接口（v4.0 因此删掉了分布）。v5.0 直接读合约：
 
 ```
-票价   = 期望 backing × (1 + surcharge)
-卖回去 = backing × 回售折价
-        回售折价 ÷ (1 + surcharge)
+slotToListing(slot) → 仓位 id        公开 mapping；槽位从 1 开始，释放后复用，中间有空洞
+listings(id)        → weight、value（backing）、状态
 ```
 
-这个数与池子大小、池子构成、什么时候抽全都无关——但**与那两个参数有关**，而参数 owner 随时可改，并且确实改过。上线时是 1000 / 8500 bps，即 0.85 / 1.10 = **77.3%**；2026-08 起是 250 / 9000 bps，即 0.90 / 1.025 = **87.8%**。面板每次刷新都实时读这两个值、一个都不写死，所以它显示的就是当下的真实数字。能高过它的路只有两条：抽到地板价高于押金的 NFT 并选择留下，以及冷启动的 FWA 额度——按当前参数依然不到打平。
+调用经 Multicall3 打包，走站点自己的 `/api/rpc`，全部钉在**同一个区块**。首次加载扫描全部槽位（约 25–40 秒）；之后只重读已知 id 和新建 id（约 5–10 秒），对账不通过就自动回退全量扫描。已知 id 缓存在 `localStorage`。
 
-「连抽」页签会给出一个不那么直观的结果：**不亏概率在 3 次左右见顶**，之后单调下滑。所谓「最优」，指的是**亏得最不确定**，不是能赢。
+### 为什么数字可信
+
+每次枚举都要在同一区块与合约通过三项 BigInt 精确对账：
+
+```
+读到的仓位数        == activeListingCount
+Σ weight            == totalWeight
+Σ weight × backing  == weightedBackingTotal      （合约内 _evOf = w·v）
+```
+
+只要漏读或读错一条，这三个等式就不可能同时成立。不成立时，档位分布页会直接说明，不显示任何分布。
+
+票价取合约 `quoteAcquisitionPrice().total`，就是 `acquire()` 实际收的钱。面板还用聚合量和枚举结果各算一遍，三者必须一致。
+
+### 核心恒等式
+
+```
+票价 = 期望 backing × (1 + 加价)          期望 backing = Σ(w·b)/Σw = 调和均值
+回售 = backing × 回售比例                  （FWAV2._settleBackingToPurchaser）
+RTP  = 回售比例 ÷ (1 + 加价)
+```
+
+RTP 与池子大小、构成、什么时候抽都无关，只由参数决定，而参数 owner 可改——面板每次从合约实时读。写作时（2026-10-08）：加价 5%，拿 ETH 回售 90% → RTP **85.71%**，拿 FWA 回售 91.5% → RTP **87.14%**。
+
+真正取决于池子的是**分布形状**：反比权重下小仓位被抽中的概率高得多，所以中位数那一抽拿回的远低于票价，期望值靠一条很薄的大仓位尾巴撑起来。实测当前池子：不亏概率约 26%，中位数拿回约为花费的 0.75 倍。
+
+### v5.0 改动
+
+- **档位分布回来了**，基于链上全池计算，并经过精确对账。
+- **连抽蒙特卡洛回来了**（v4.0 只能列期望值）。
+- **票价改用合约报价。** v4.0 额外估了一笔自付 VRF gas（800k × 1.3）。V2 的 VRF 成本是链上的 `vrfServiceFee`，已经含在报价里，v4.0 多算了。
+- **gas 按主网实测标定**：近期 76 笔单抽 `acquire` 平均 61 万 gas；结算拿 ETH 约 17.5 万，拿 FWA 约 30 万。
+- **链上参数优先于索引器**，两者不一致时自检会标出来。
 
 ### 局限
 
-面板的**局限**页签会在运行时带着实时数字逐条列出。简要说：
+局限页签会带着实时数字逐条列出。简要说：没算「留下 NFT」这条路（拿不到可靠的地板价）；FWA 口径按花掉的 ETH 计，未扣兑换滑点；下单到抽选之间池子可能变化；gas 是估算；退款未摊进期望；奖励（顶部仓位奖池、epoch $FWA、builder 奖励）未计入，因此面板偏保守；每天 UTC 11:45–12:00、23:45–24:00（北京时间 19:45–20:00、7:45–8:00）暂停下单。
 
-- **我没有读过合约源码。**公式来自官方 docs 的文字与技术小节，不是从 Solidity 逐行核对来的。双路径对拍确实证明了权重与定价和线上实现吻合，但这不等于审计过代码。
-- **拿不到地板价。**「拿回」按卖回价计，是下限。若你选择留下 NFT，注意地板价是挂单价，不是成交价。
-- **退款风险未摊进期望。**实时退款率每次刷新从 `gameState` 读取（2026-08 时为 15.1 万次抽奖中的 **3.8%**），且这些情况下 VRF 服务费不退。
-- **两笔交易的 gas 是估算**（购买与结算）。VRF 的 800k × 1.3 出自 docs，但 owner 可改。
-- **每日 $FWA 买家池未计入**——外部买盘关闭期间难以定价。这是唯一让面板偏保守的一项。
-- **连抽按独立同分布处理。**当前池子规模下成立；若池子缩到几百个仓位，这个近似会失效。
+### 构建
 
-给定池子快照，概览页上每个概率和金额都是**精确解析解**，不是近似。不确定性来自上面这几条，不来自算法本身。
+```
+node src/build.mjs
+```
+
+由 `src/panel.js` 和 `src/strings.{zh,en}.js` 生成 `fwa-odds-panel.zh.user.js` 与 `fwa-odds-panel.en.user.js`。
 
 ### 说明
 
-只读。脚本从不请求钱包授权、不签名、不外发任何数据，全部在你的浏览器里运行。
-
-若 fwa.fun 再次改版，面板会明确报「找不到仓位列表」，而不是悄悄给出错数字。
-
-仅供研究，不构成投资建议。
-
----
-
-## License
-
-MIT — see [LICENSE](LICENSE).
-
-Not affiliated with TokenWorks or fwa.fun.
+**只读。** 不请求钱包、不签名，除了 fwa.fun 自己的接口不向任何地方发数据。研究工具，非投资建议。
