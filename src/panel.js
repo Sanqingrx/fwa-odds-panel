@@ -1,20 +1,26 @@
 /*@HEADER@*/
 /* ═══════════════════════════════════════════════════════════════════════════
- *  FWA V2 Odds Panel — v5.0
+ *  FWA V2 Odds Panel — v5.1
  *
- *  v5.0 brings back the full outcome distribution. v4.0 dropped it because the
- *  site has no endpoint that enumerates the pool. v5.0 reads the pool straight
- *  from the FWAV2 contract instead:
+ *  v5.0 brought back the full outcome distribution. v4.0 dropped it because the
+ *  site has no endpoint that enumerates the pool. The pool is read straight from
+ *  the FWAV2 contract instead:
  *
  *    slotToListing(slot) → listingId      (public mapping, slots start at 1,
  *                                          freed slots are reused, so the range
  *                                          has holes)
  *    listings(id)        → weight, value (backing), status, …
  *
- *  The calls are batched through Multicall3 (aggregate3) and sent via the site's
- *  own /api/rpc proxy, all pinned to ONE block number. Every enumeration has to
- *  pass three exact BigInt checks against the contract's own totals at that same
- *  block before any distribution is drawn:
+ *  v5.1 reads the whole pool in ONE eth_call (~1 s instead of 25–40 s): the call
+ *  carries the init code of src/PoolReader.sol and no `to`, so the node runs its
+ *  constructor against live state; it walks the slots, calls listings() on each
+ *  occupied one and reverts with the packed result (revert data, because returned
+ *  init-code output is capped at 24 KB). Nothing is deployed or signed. If that
+ *  path fails, the v5.0 Multicall3 scan is used instead.
+ *
+ *  Everything goes through the site's own /api/rpc proxy, pinned to ONE block
+ *  number. Every enumeration has to pass three exact BigInt checks against the
+ *  contract's own totals at that same block before any distribution is drawn:
  *
  *    count(listings)  == activeListingCount
  *    Σ weight         == totalWeight
@@ -43,7 +49,7 @@
   if (window.__fwaPanel) { window.__fwaPanel.refresh(); return; }
 
   const S = /*@STRINGS@*/null;
-  const VERSION = '5.0';
+  const VERSION = '5.1';
 
   const E = 1e18;
   const E36 = 10n ** 36n;
@@ -54,6 +60,9 @@
   const CHUNK = 200;                         // calls per aggregate3 (site proxy caps the body ~100 KB)
   const PAR = 6;                             // parallel requests
   const SLOT_CAP = 200000;                   // hard stop for the slot scan
+  const READER_SPAN = 20000;                 // slots per PoolReader call (~1 s each)
+  const READER_MAGIC = '465741504f4f4c31';   // "FWAPOOL1"
+  const READER_CODE = '/*@READER@*/';        // init code of src/PoolReader.sol (solc 0.8.26, opt 200)
 
   // Selectors (keccak256 of the signature, first 4 bytes)
   const SEL = {
@@ -226,12 +235,51 @@
              exact, sw, swb, ok: list.length === cs.n && sw === cs.W && swb === cs.WB };
   }
 
+  /* Fast path: one eth_call per READER_SPAN slots. The call has no `to`, so the node runs
+     PoolReader's init code (src/PoolReader.sol) against live state at the pinned block; the
+     constructor reads slotToListing + listings for every slot and reverts with the packed
+     result. Nothing is deployed and nothing is signed — it is a read like any other eth_call. */
+  async function readerScan(C, cs) {
+    const list = []; let from = 1;
+    while (list.length < cs.n && from < SLOT_CAP) {
+      const to = from + READER_SPAN;
+      onProgress(S.progReader(list.length, cs.n));
+      const data = '0x' + READER_CODE + w64(C) + w64(from) + w64(to);
+      const r = await fetch('/api/rpc', { method: 'POST', headers: HDR,
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_call', params: [{ data }, cs.block] }) });
+      const j = await r.json().catch(() => null);
+      const d = j && j.error && j.error.data;
+      const out = typeof d === 'string' ? d : (d && d.data);   // some nodes nest it
+      if (!out || out.slice(2, 18) !== READER_MAGIC) throw new Error('reader: ' + JSON.stringify(j).slice(0, 120));
+      const h = out.slice(66);
+      for (let i = 0; i + 64 <= h.length; i += 64) {
+        const x = BigInt('0x' + h.slice(i, i + 64));
+        list.push({ id: x >> 224n, v: (x >> 128n) & ((1n << 96n) - 1n), w: x & ((1n << 128n) - 1n), st: ACTIVE });
+      }
+      from = to;
+    }
+    return list;
+  }
+
   async function enumeratePool(C, cs) {
     const t0 = performance.now();
-    const prev = (POOL && POOL.C === C) ? { nextId: POOL.nextId, ids: POOL.list.map(x => x.id) } : loadCache(C);
-    let list = null, mode = 'full', chk = null;
+    let list = null, mode = 'reader', chk = null;
 
-    // Fast path: re-read every previously active id + every id created since, at this block.
+    try {
+      list = await readerScan(C, cs);
+      chk = checkPool(list, cs);
+      if (!chk.ok) list = null;
+    } catch (e) { list = null; }
+    if (list) {
+      const p = { C, block: cs.blockNum, nextId: cs.nextId, list, chk, mode, ms: performance.now() - t0, at: Date.now() };
+      saveCache(p);
+      return p;
+    }
+
+    // Fallback: Multicall3 over slotToListing / listings.
+    const prev = (POOL && POOL.C === C) ? { nextId: POOL.nextId, ids: POOL.list.map(x => x.id) } : loadCache(C);
+    mode = 'full';
+    // Re-read every previously active id + every id created since, at this block.
     if (prev && prev.ids.length) {
       const cand = prev.ids.slice();
       for (let id = prev.nextId; id < cs.nextId; id++) cand.push(BigInt(id));
@@ -453,7 +501,15 @@
   #fwaP.min .tabs,#fwaP.min .bd,#fwaP.min .ft{display:none}
   `;
 
-  let TAB = 0, ROUTE = 'eth', LAST = null, timer = null, busy = false, MULTI = { key: null, rows: null };
+  const PREF_KEY = 'fwaOddsPanel.prefs';
+  const prefs = (() => { try { return JSON.parse(localStorage.getItem(PREF_KEY) || '{}'); } catch (e) { return {}; } })();
+  const savePrefs = () => { try { localStorage.setItem(PREF_KEY, JSON.stringify({ tab: TAB, route: ROUTE })); } catch (e) {} };
+  const REFRESH_MS = 60000;
+
+  // Opens on the tier distribution by default; remembers the last tab and route.
+  let TAB = Number.isInteger(prefs.tab) && prefs.tab >= 0 && prefs.tab < S.tabs.length ? prefs.tab : 1;
+  let ROUTE = prefs.route === 'fwa' ? 'fwa' : 'eth';
+  let LAST = null, timer = null, busy = false, MULTI = { key: null, rows: null }, lastOk = 0, renderedTab = -1;
 
   function el(html) { const d = document.createElement('div'); d.innerHTML = html.trim(); return d.firstChild; }
   const sign = x => (x >= 0 ? '+' : '') + F(x, 5);
@@ -603,8 +659,12 @@
       <div class="note">${S.readOnly}</div>`;
     }
 
+    // Keep the reader's place: a background refresh must not jump the view back to the top.
+    const keep = renderedTab === TAB ? bd.scrollTop : 0;
     bd.innerHTML = h;
-    bd.querySelectorAll('[data-route]').forEach(b => b.onclick = () => { ROUTE = b.dataset.route; render(); });
+    bd.scrollTop = keep;
+    renderedTab = TAB;
+    bd.querySelectorAll('[data-route]').forEach(b => b.onclick = () => { ROUTE = b.dataset.route; savePrefs(); render(); });
   }
 
   /* ══════════════ main loop ══════════════ */
@@ -618,27 +678,40 @@
       onProgress(S.progState);
       const gs = await fetchConfig();
       const C = contractOf(gs);
-      let cs = await chainSummary(C);
+      const cs = await chainSummary(C);
       let gasWei = 0;
       try { gasWei = parseInt(await rpc('eth_gasPrice'), 16); } catch (e) {}
 
-      // 1) show aggregates right away
-      let c = compute(gs, cs, null, gasWei);
-      LAST = { c, tests: selfTests(c) };
-      render();
+      // First load only: show the aggregates while the pool is read. On later refreshes the
+      // previous verified view stays on screen until the new one is ready — no flicker.
+      const hadPool = !!(LAST && LAST.c && LAST.c.pool);
+      if (!hadPool) {
+        const c0 = compute(gs, cs, null, gasWei);
+        LAST = { c: c0, tests: selfTests(c0) };
+        render();
+      }
 
-      // 2) enumerate the pool at the same block, then redraw with the distribution
-      POOL = await enumeratePool(C, cs);
-      c = compute(gs, cs, POOL, gasWei);
-      LAST = { c, tests: selfTests(c) };
-      render();
-      onProgress(S.updated(new Date().toLocaleTimeString(), cs.blockNum, POOL));
+      const pool = await enumeratePool(C, cs);
+      POOL = pool;
+      const c = compute(gs, cs, pool, gasWei);
+      if (c.pool || !hadPool) {
+        LAST = { c, tests: selfTests(c) };
+        render();
+      }
+      if (c.pool) lastOk = Date.now();
+      onProgress(c.pool ? S.updated(new Date().toLocaleTimeString(), cs.blockNum, pool)
+                        : S.poolFailShort);
     } catch (e) {
-      if (!LAST || !LAST.c) LAST = { err: String(e && e.message || e) };
-      render();
+      if (!LAST || !LAST.c) { LAST = { err: String(e && e.message || e) }; render(); }
       onProgress(S.errShort + ': ' + String(e && e.message || e).slice(0, 80));
     } finally { busy = false; }
   }
+
+  // Auto-refresh only while the tab is visible; catch up as soon as it comes back.
+  function tick() { if (!document.hidden) refresh(); }
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden && Date.now() - lastOk > REFRESH_MS) refresh();
+  });
 
   function mount() {
     const style = document.createElement('style');
@@ -648,7 +721,7 @@
     const p = el(`<div id="fwaP">
       <div class="hd"><b>${S.title}</b><span class="sp"></span>
         <button class="mn">—</button><button class="rf">${S.refresh}</button><button class="cl">×</button></div>
-      <div class="tabs">${S.tabs.map((t, i) => `<div class="${i === 0 ? 'on' : ''}">${t}</div>`).join('')}</div>
+      <div class="tabs">${S.tabs.map((t, i) => `<div class="${i === TAB ? 'on' : ''}">${t}</div>`).join('')}</div>
       <div class="bd"><div class="note">${S.starting}</div></div>
       <div class="ft"><span class="st">${S.starting}</span><span>v${VERSION}</span></div>
     </div>`);
@@ -656,7 +729,7 @@
 
     const tabs = [...p.querySelectorAll('.tabs div')];
     tabs.forEach((t, i) => t.onclick = () => {
-      TAB = i; tabs.forEach(x => x.classList.remove('on')); t.classList.add('on'); render();
+      TAB = i; tabs.forEach(x => x.classList.remove('on')); t.classList.add('on'); savePrefs(); render();
     });
     p.querySelector('.rf').onclick = refresh;
     p.querySelector('.mn').onclick = () => p.classList.toggle('min');
@@ -682,7 +755,7 @@
 
     window.__fwaPanel = { refresh, state: () => LAST };
     refresh();
-    timer = setInterval(refresh, 60000);
+    timer = setInterval(tick, REFRESH_MS);
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', mount);

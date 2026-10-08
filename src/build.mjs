@@ -7,6 +7,8 @@ import { fileURLToPath } from 'node:url';
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, '..');
 const panel = readFileSync(join(here, 'panel.js'), 'utf8');
+const reader = readFileSync(join(here, 'PoolReader.hex'), 'utf8').trim();
+if (!/^[0-9a-f]+$/.test(reader)) throw new Error('PoolReader.hex is not hex');
 
 const META = {
   zh: {
@@ -25,7 +27,7 @@ for (const lang of ['zh', 'en']) {
     '// ==UserScript==',
     `// @name         ${META[lang].name}`,
     '// @namespace    fwa.monitor',
-    '// @version      5.0',
+    '// @version      5.1',
     `// @description  ${META[lang].description}`,
     '// @match        https://www.fwa.fun/*',
     '// @match        https://fwa.fun/*',
@@ -33,7 +35,7 @@ for (const lang of ['zh', 'en']) {
     '// @grant        none',
     '// ==/UserScript=='
   ].join('\n');
-  const out = panel.replace('/*@HEADER@*/', header).replace('/*@STRINGS@*/null', strings);
+  const out = panel.replace('/*@HEADER@*/', header).replace('/*@STRINGS@*/null', strings).replace('/*@READER@*/', reader);
   if (out.includes('/*@')) throw new Error('unreplaced placeholder in ' + lang);
   writeFileSync(join(root, `fwa-odds-panel.${lang}.user.js`), out);
   console.log('wrote', `fwa-odds-panel.${lang}.user.js`, out.length, 'bytes');

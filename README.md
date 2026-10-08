@@ -29,7 +29,7 @@ Chinese interface: use `fwa-odds-panel.zh.user.js`. Both files are built from th
 | **Self-test** | 18 checks re-run on every refresh, each with PASS/FAIL and the numbers behind it |
 | **Limits** | What this tool cannot tell you |
 
-Tiers and multi-pull have an ETH / FWA switch. Draggable, collapsible, refreshes every 60 s.
+Opens on **Tiers** and remembers your last tab and ETH / FWA choice. Draggable, collapsible. Refreshes every 60 s while the browser tab is visible; the previous result stays on screen (scroll position included) until the new one has been verified, so a refresh never interrupts reading.
 
 ### How the pool is read
 
@@ -40,7 +40,11 @@ slotToListing(slot) → listingId     public mapping; slots start at 1 and are r
 listings(id)        → weight, value (backing), status
 ```
 
-Calls are batched through Multicall3 over the site's own `/api/rpc`, all pinned to **one block**. The first load walks every slot (about 25–40 s); after that the panel re-reads only the known ids plus newly created ones (about 5–10 s), and falls back to a full scan if that does not reconcile. Known ids are cached in `localStorage`.
+To make this fast, the panel sends the init code of a small read-only scanner, [`src/PoolReader.sol`](src/PoolReader.sol), as an `eth_call` with no `to`. The node runs its constructor against live state: it walks every slot, calls `listings()` on each occupied one and reverts with the packed result (revert data, because returned init-code output is capped at 24 KB by EIP-170). Nothing is deployed, signed or paid for. **The whole pool comes back in one call, about 1 s.**
+
+Everything goes through the site's own `/api/rpc`, pinned to **one block**. If the scanner path fails, the panel falls back to batched Multicall3 reads of the same two functions (about 25 s the first time, 5–10 s after that); the result has to pass the same checks either way.
+
+`src/PoolReader.hex` is reproducible: `npm i solc@0.8.26 && node src/compile-reader.cjs` gives the same bytes.
 
 ### Why the numbers can be trusted
 
@@ -68,6 +72,12 @@ RTP does not depend on pool size, composition or timing. It depends only on the 
 
 What *does* depend on the pool is the **shape**: with inverse weights, small listings are drawn far more often, so the median pull returns well under the ticket while a thin tail of large listings carries the expectation. Measured on the live pool: chance of not losing ≈ 26%, median return ≈ 0.75× cost.
 
+### Changes in v5.1
+
+- **Pool read in one call (~1 s instead of 25–40 s)** via the PoolReader scanner; Multicall3 kept as fallback.
+- **Refreshes no longer interrupt you**: the last verified view stays up until the new one is ready, scroll position is kept, and auto-refresh pauses while the browser tab is hidden.
+- **Opens on the Tiers tab** and remembers the tab and settlement route you last used.
+
 ### Changes in v5.0
 
 - **Tier distribution is back**, computed from the full on-chain pool with exact reconciliation.
@@ -86,7 +96,7 @@ The Limits tab lists these with live numbers. In short: keeping the NFT is not m
 node src/build.mjs
 ```
 
-writes `fwa-odds-panel.zh.user.js` and `fwa-odds-panel.en.user.js` from `src/panel.js` and `src/strings.{zh,en}.js`.
+writes `fwa-odds-panel.zh.user.js` and `fwa-odds-panel.en.user.js` from `src/panel.js`, `src/strings.{zh,en}.js` and `src/PoolReader.hex`.
 
 ### Notes
 
@@ -115,7 +125,7 @@ writes `fwa-odds-panel.zh.user.js` and `fwa-odds-panel.en.user.js` from `src/pan
 | **自检** | 18 项检验，每次刷新现场重跑，显示 PASS/FAIL 和对应数字 |
 | **局限** | 这个工具算不出来的东西 |
 
-档位分布和连抽可切换 ETH / FWA 口径。面板可拖动、可折叠，每 60 秒自动刷新。
+默认打开**档位分布**，并记住你上次停留的页签和 ETH / FWA 选择。面板可拖动、可折叠。浏览器标签页在前台时每 60 秒刷新一次；新结果对账通过之前，旧结果（连同滚动位置）一直留在屏幕上，刷新不会打断阅读。
 
 ### 全池是怎么拿到的
 
@@ -126,7 +136,11 @@ slotToListing(slot) → 仓位 id        公开 mapping；槽位从 1 开始，�
 listings(id)        → weight、value（backing）、状态
 ```
 
-调用经 Multicall3 打包，走站点自己的 `/api/rpc`，全部钉在**同一个区块**。首次加载扫描全部槽位（约 25–40 秒）；之后只重读已知 id 和新建 id（约 5–10 秒），对账不通过就自动回退全量扫描。已知 id 缓存在 `localStorage`。
+为了快，面板把一个只读小扫描器 [`src/PoolReader.sol`](src/PoolReader.sol) 的初始化代码当作不带 `to` 的 `eth_call` 发给节点。节点在链上状态里执行它的构造函数：遍历全部槽位，对有仓位的槽位调 `listings()`，再把打包好的结果放在 revert 数据里带回（构造函数正常返回的数据受 EIP-170 的 24KB 上限限制）。不部署合约、不签名、不花钱。**一次调用拿回整个池子，约 1 秒。**
+
+所有读取走站点自己的 `/api/rpc`，钉在**同一个区块**。扫描器这条路走不通时，自动改用 Multicall3 分批读同样两个函数（首次约 25 秒，之后 5–10 秒），结果一样要过对账。
+
+`src/PoolReader.hex` 可复现：`npm i solc@0.8.26 && node src/compile-reader.cjs` 得到相同字节。
 
 ### 为什么数字可信
 
@@ -154,6 +168,12 @@ RTP 与池子大小、构成、什么时候抽都无关，只由参数决定，�
 
 真正取决于池子的是**分布形状**：反比权重下小仓位被抽中的概率高得多，所以中位数那一抽拿回的远低于票价，期望值靠一条很薄的大仓位尾巴撑起来。实测当前池子：不亏概率约 26%，中位数拿回约为花费的 0.75 倍。
 
+### v5.1 改动
+
+- **一次调用读完全池（约 1 秒，原来 25–40 秒）**，靠 PoolReader 扫描器；Multicall3 保留为备用通道。
+- **刷新不再打断阅读**：新结果就绪前保留上一次已验证的画面和滚动位置；浏览器标签页在后台时暂停自动刷新。
+- **默认打开档位分布页**，并记住上次用的页签和结算口径。
+
 ### v5.0 改动
 
 - **档位分布回来了**，基于链上全池计算，并经过精确对账。
@@ -172,7 +192,7 @@ RTP 与池子大小、构成、什么时候抽都无关，只由参数决定，�
 node src/build.mjs
 ```
 
-由 `src/panel.js` 和 `src/strings.{zh,en}.js` 生成 `fwa-odds-panel.zh.user.js` 与 `fwa-odds-panel.en.user.js`。
+由 `src/panel.js`、`src/strings.{zh,en}.js` 和 `src/PoolReader.hex` 生成 `fwa-odds-panel.zh.user.js` 与 `fwa-odds-panel.en.user.js`。
 
 ### 说明
 

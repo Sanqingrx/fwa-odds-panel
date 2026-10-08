@@ -15,10 +15,12 @@
 
     progState: '读取协议状态…',
     progRead: '读取仓位',
+    progReader: (f, n) => '读取全池 ' + f + '/' + n + '…',
+    poolFailShort: '本次全池对账未通过，仍显示上一次的结果',
     progScan: (f, n, s) => '扫描槽位 ' + f + '/' + n + '（已扫到第 ' + s + ' 号）',
-    updated: (t, b, p) => '更新于 ' + t + ' · 区块 ' + b + ' · 枚举 ' + (p.ms / 1000).toFixed(1) + 's' + (p.mode === 'full' ? '（全量）' : ''),
+    updated: (t, b, p) => '更新于 ' + t + ' · 区块 ' + b + ' · 读池 ' + (p.ms / 1000).toFixed(1) + 's' + (p.mode === 'reader' ? '' : '（备用通道）') + ' · 每 60 秒刷新',
 
-    poolPending: '正在从链上枚举全池（首次约 30–40 秒，之后约 10 秒）。档位分布、不亏概率和连抽会在完成后出现。',
+    poolPending: '正在从链上读取全池（通常 1–3 秒）。档位分布、不亏概率和连抽会在完成后出现。',
     poolFail: k => '<b>全池枚举未通过对账，分布不予显示。</b><br>数量 ' + (k.count ? '✓' : '✗') +
       ' · Σweight ' + (k.sumW ? '✓' : '✗') + ' · Σ(w·b) ' + (k.sumWB ? '✓' : '✗') + '。下次刷新会自动重试。',
 
@@ -67,8 +69,9 @@
     enumTitle: '全池是怎么拿到的',
     enumText: 'fwa.fun 网站不提供全池列表（v4.0 因此删掉了分布）。v5.0 直接读 FWAV2 合约：' +
       '<code>slotToListing(slot)</code> 给出每个槽位上的仓位 id（槽位从 1 开始，释放后会复用，所以中间有空洞），' +
-      '<code>listings(id)</code> 给出 weight、backing 和状态。调用经 Multicall3 打包、走站点自己的 /api/rpc，' +
-      '所有读取钉在<b>同一个区块</b>。之后只重读已知 id 和新建 id（约 10 秒），对账不通过就自动回退全量扫描。',
+      '<code>listings(id)</code> 给出 weight、backing 和状态。' +
+      '为了快，面板把一小段只读扫描代码（仓库 src/PoolReader.sol）随 eth_call 发给节点，由节点在链上状态里一次跑完全部槽位，约 1 秒返回整个池子——不部署合约、不签名、不花钱。' +
+      '所有读取走站点自己的 /api/rpc，钉在<b>同一个区块</b>。这条路走不通时自动改用 Multicall3 逐批读取（慢，但结果一样要过对账）。',
     distHow: '为什么分布可信',
     distHowText: '每次枚举必须与合约自己的合计在同一区块<b>逐位相等</b>：仓位数 = activeListingCount，Σweight = totalWeight，' +
       'Σ(weight×backing) = weightedBackingTotal（合约内 _evOf = w·v）。任何一条漏读或读错，这三个等式都不可能同时成立。' +

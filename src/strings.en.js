@@ -15,10 +15,12 @@
 
     progState: 'Reading protocol state…',
     progRead: 'Reading listings',
+    progReader: (f, n) => 'Reading pool ' + f + '/' + n + '…',
+    poolFailShort: 'This read did not reconcile; still showing the previous result',
     progScan: (f, n, s) => 'Scanning slots ' + f + '/' + n + ' (up to slot ' + s + ')',
-    updated: (t, b, p) => 'Updated ' + t + ' · block ' + b + ' · enumerated in ' + (p.ms / 1000).toFixed(1) + 's' + (p.mode === 'full' ? ' (full)' : ''),
+    updated: (t, b, p) => 'Updated ' + t + ' · block ' + b + ' · pool read in ' + (p.ms / 1000).toFixed(1) + 's' + (p.mode === 'reader' ? '' : ' (fallback)') + ' · every 60 s',
 
-    poolPending: 'Enumerating the full pool from the chain (about 30–40 s the first time, about 10 s after that). Tiers, chance of not losing and multi-pull appear once it finishes.',
+    poolPending: 'Reading the full pool from the chain (usually 1–3 s). Tiers, chance of not losing and multi-pull appear once it finishes.',
     poolFail: k => '<b>The pool enumeration did not reconcile, so no distribution is shown.</b><br>count ' + (k.count ? '✓' : '✗') +
       ' · Σweight ' + (k.sumW ? '✓' : '✗') + ' · Σ(w·b) ' + (k.sumWB ? '✓' : '✗') + '. The next refresh retries automatically.',
 
@@ -67,8 +69,9 @@
     enumTitle: 'How the full pool is read',
     enumText: 'The fwa.fun site has no full pool listing (that is why v4.0 dropped the distribution). v5.0 reads the FWAV2 contract directly: ' +
       '<code>slotToListing(slot)</code> gives the listing id in each slot (slots start at 1 and are reused when freed, so the range has holes), ' +
-      'and <code>listings(id)</code> gives weight, backing and status. Calls are batched through Multicall3 over the site\'s own /api/rpc, ' +
-      'and every read is pinned to <b>one block</b>. Later refreshes only re-read known ids plus new ids (about 10 s); if that fails to reconcile it falls back to a full slot scan.',
+      'and <code>listings(id)</code> gives weight, backing and status. ' +
+      'For speed, the panel sends a small read-only scanner (src/PoolReader.sol in the repo) with an eth_call; the node runs it over every slot against live state and returns the whole pool in about 1 s — nothing is deployed, signed or paid for. ' +
+      'Everything goes through the site\'s own /api/rpc, pinned to <b>one block</b>. If that path fails, the panel falls back to batched Multicall3 reads (slower, and the result must pass the same reconciliation).',
     distHow: 'Why the distribution can be trusted',
     distHowText: 'Every enumeration must match the contract\'s own totals <b>exactly</b> at the same block: count = activeListingCount, Σweight = totalWeight, ' +
       'Σ(weight×backing) = weightedBackingTotal (the contract\'s _evOf = w·v). If a single listing were missed or misread, the three could not all hold. ' +

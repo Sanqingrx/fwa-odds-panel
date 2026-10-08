@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FWA V2 Odds Panel
 // @namespace    fwa.monitor
-// @version      5.0
+// @version      5.1
 // @description  Live odds inside fwa.fun V2: true cost per pull, expected return on both settlement routes, seven-tier outcome distribution with chance of not losing, and multi-pull simulation. The full pool is read from the contract and reconciled exactly against its totals.
 // @match        https://www.fwa.fun/*
 // @match        https://fwa.fun/*
@@ -9,21 +9,27 @@
 // @grant        none
 // ==/UserScript==
 /* ═══════════════════════════════════════════════════════════════════════════
- *  FWA V2 Odds Panel — v5.0
+ *  FWA V2 Odds Panel — v5.1
  *
- *  v5.0 brings back the full outcome distribution. v4.0 dropped it because the
- *  site has no endpoint that enumerates the pool. v5.0 reads the pool straight
- *  from the FWAV2 contract instead:
+ *  v5.0 brought back the full outcome distribution. v4.0 dropped it because the
+ *  site has no endpoint that enumerates the pool. The pool is read straight from
+ *  the FWAV2 contract instead:
  *
  *    slotToListing(slot) → listingId      (public mapping, slots start at 1,
  *                                          freed slots are reused, so the range
  *                                          has holes)
  *    listings(id)        → weight, value (backing), status, …
  *
- *  The calls are batched through Multicall3 (aggregate3) and sent via the site's
- *  own /api/rpc proxy, all pinned to ONE block number. Every enumeration has to
- *  pass three exact BigInt checks against the contract's own totals at that same
- *  block before any distribution is drawn:
+ *  v5.1 reads the whole pool in ONE eth_call (~1 s instead of 25–40 s): the call
+ *  carries the init code of src/PoolReader.sol and no `to`, so the node runs its
+ *  constructor against live state; it walks the slots, calls listings() on each
+ *  occupied one and reverts with the packed result (revert data, because returned
+ *  init-code output is capped at 24 KB). Nothing is deployed or signed. If that
+ *  path fails, the v5.0 Multicall3 scan is used instead.
+ *
+ *  Everything goes through the site's own /api/rpc proxy, pinned to ONE block
+ *  number. Every enumeration has to pass three exact BigInt checks against the
+ *  contract's own totals at that same block before any distribution is drawn:
  *
  *    count(listings)  == activeListingCount
  *    Σ weight         == totalWeight
@@ -68,10 +74,12 @@
 
     progState: 'Reading protocol state…',
     progRead: 'Reading listings',
+    progReader: (f, n) => 'Reading pool ' + f + '/' + n + '…',
+    poolFailShort: 'This read did not reconcile; still showing the previous result',
     progScan: (f, n, s) => 'Scanning slots ' + f + '/' + n + ' (up to slot ' + s + ')',
-    updated: (t, b, p) => 'Updated ' + t + ' · block ' + b + ' · enumerated in ' + (p.ms / 1000).toFixed(1) + 's' + (p.mode === 'full' ? ' (full)' : ''),
+    updated: (t, b, p) => 'Updated ' + t + ' · block ' + b + ' · pool read in ' + (p.ms / 1000).toFixed(1) + 's' + (p.mode === 'reader' ? '' : ' (fallback)') + ' · every 60 s',
 
-    poolPending: 'Enumerating the full pool from the chain (about 30–40 s the first time, about 10 s after that). Tiers, chance of not losing and multi-pull appear once it finishes.',
+    poolPending: 'Reading the full pool from the chain (usually 1–3 s). Tiers, chance of not losing and multi-pull appear once it finishes.',
     poolFail: k => '<b>The pool enumeration did not reconcile, so no distribution is shown.</b><br>count ' + (k.count ? '✓' : '✗') +
       ' · Σweight ' + (k.sumW ? '✓' : '✗') + ' · Σ(w·b) ' + (k.sumWB ? '✓' : '✗') + '. The next refresh retries automatically.',
 
@@ -120,8 +128,9 @@
     enumTitle: 'How the full pool is read',
     enumText: 'The fwa.fun site has no full pool listing (that is why v4.0 dropped the distribution). v5.0 reads the FWAV2 contract directly: ' +
       '<code>slotToListing(slot)</code> gives the listing id in each slot (slots start at 1 and are reused when freed, so the range has holes), ' +
-      'and <code>listings(id)</code> gives weight, backing and status. Calls are batched through Multicall3 over the site\'s own /api/rpc, ' +
-      'and every read is pinned to <b>one block</b>. Later refreshes only re-read known ids plus new ids (about 10 s); if that fails to reconcile it falls back to a full slot scan.',
+      'and <code>listings(id)</code> gives weight, backing and status. ' +
+      'For speed, the panel sends a small read-only scanner (src/PoolReader.sol in the repo) with an eth_call; the node runs it over every slot against live state and returns the whole pool in about 1 s — nothing is deployed, signed or paid for. ' +
+      'Everything goes through the site\'s own /api/rpc, pinned to <b>one block</b>. If that path fails, the panel falls back to batched Multicall3 reads (slower, and the result must pass the same reconciliation).',
     distHow: 'Why the distribution can be trusted',
     distHowText: 'Every enumeration must match the contract\'s own totals <b>exactly</b> at the same block: count = activeListingCount, Σweight = totalWeight, ' +
       'Σ(weight×backing) = weightedBackingTotal (the contract\'s _evOf = w·v). If a single listing were missed or misread, the three could not all hold. ' +
@@ -161,7 +170,7 @@
     contract: 'Contract', chainBlock: 'Chain block', indexBlock: 'Indexer block',
     readOnly: 'Read-only: no wallet access, no signing, no data sent anywhere except fwa.fun\'s own endpoints. Research tool, not investment advice.'
 };
-  const VERSION = '5.0';
+  const VERSION = '5.1';
 
   const E = 1e18;
   const E36 = 10n ** 36n;
@@ -172,6 +181,9 @@
   const CHUNK = 200;                         // calls per aggregate3 (site proxy caps the body ~100 KB)
   const PAR = 6;                             // parallel requests
   const SLOT_CAP = 200000;                   // hard stop for the slot scan
+  const READER_SPAN = 20000;                 // slots per PoolReader call (~1 s each)
+  const READER_MAGIC = '465741504f4f4c31';   // "FWAPOOL1"
+  const READER_CODE = '608060405234801561000f575f80fd5b5060405161043538038061043583398101604081905261002e91610282565b5f61003983836102ca565b90505f6100478260206102e3565b6100529060206102fa565b6001600160401b038111156100695761006961030d565b6040519080825280601f01601f191660200182016040528015610093576020820181803683370190505b5090505f845b8481101561024d5760405163e2881eb760e01b8152600481018290525f906001600160a01b0389169063e2881eb790602401602060405180830381865afa1580156100e6573d5f803e3d5ffd5b505050506040513d601f19601f8201168201806040525081019061010a9190610321565b9050805f036101195750610245565b5f805f8a6001600160a01b031663de74e57b856040518263ffffffff1660e01b815260040161014a91815260200190565b61016060405180830381865afa158015610166573d5f803e3d5ffd5b505050506040513d601f19601f8201168201806040525081019061018a919061034d565b9a505050505096509650505050508060ff166001146101ac5750505050610245565b640100000000841080156101cc57506c0100000000000000000000000082105b80156101db5750600160801b83105b61021b5760405162461bcd60e51b815260206004820152600d60248201526c7061636b206f766572666c6f7760981b604482015260640160405180910390fd5b60e084901b608083901b17831760208702880160400181905261023d8761041c565b965050505050505b600101610099565b5067465741504f4f4c3160c01b602083810182815283820290910190fd5b6001600160a01b038116811461027f575f80fd5b50565b5f805f60608486031215610294575f80fd5b835161029f8161026b565b602085015160409095015190969495509392505050565b634e487b7160e01b5f52601160045260245ffd5b818103818111156102dd576102dd6102b6565b92915050565b80820281158282048414176102dd576102dd6102b6565b808201808211156102dd576102dd6102b6565b634e487b7160e01b5f52604160045260245ffd5b5f60208284031215610331575f80fd5b5051919050565b805160ff81168114610348575f80fd5b919050565b5f805f805f805f805f805f6101608c8e031215610368575f80fd5b8b516103738161026b565b60208d0151909b506103848161026b565b60408d0151909a506103958161026b565b809950505f60608d01519050809850505f60808d01519050809750505f60a08d01519050809650505f60c08d01519050809550505f60e08d01519050809450505f6101008d01519050809350506101208c015160018060401b03811681146103fb575f80fd5b915061040a6101408d01610338565b90509295989b509295989b9093969950565b5f6001820161042d5761042d6102b6565b506001019056fe';        // init code of src/PoolReader.sol (solc 0.8.26, opt 200)
 
   // Selectors (keccak256 of the signature, first 4 bytes)
   const SEL = {
@@ -344,12 +356,51 @@
              exact, sw, swb, ok: list.length === cs.n && sw === cs.W && swb === cs.WB };
   }
 
+  /* Fast path: one eth_call per READER_SPAN slots. The call has no `to`, so the node runs
+     PoolReader's init code (src/PoolReader.sol) against live state at the pinned block; the
+     constructor reads slotToListing + listings for every slot and reverts with the packed
+     result. Nothing is deployed and nothing is signed — it is a read like any other eth_call. */
+  async function readerScan(C, cs) {
+    const list = []; let from = 1;
+    while (list.length < cs.n && from < SLOT_CAP) {
+      const to = from + READER_SPAN;
+      onProgress(S.progReader(list.length, cs.n));
+      const data = '0x' + READER_CODE + w64(C) + w64(from) + w64(to);
+      const r = await fetch('/api/rpc', { method: 'POST', headers: HDR,
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_call', params: [{ data }, cs.block] }) });
+      const j = await r.json().catch(() => null);
+      const d = j && j.error && j.error.data;
+      const out = typeof d === 'string' ? d : (d && d.data);   // some nodes nest it
+      if (!out || out.slice(2, 18) !== READER_MAGIC) throw new Error('reader: ' + JSON.stringify(j).slice(0, 120));
+      const h = out.slice(66);
+      for (let i = 0; i + 64 <= h.length; i += 64) {
+        const x = BigInt('0x' + h.slice(i, i + 64));
+        list.push({ id: x >> 224n, v: (x >> 128n) & ((1n << 96n) - 1n), w: x & ((1n << 128n) - 1n), st: ACTIVE });
+      }
+      from = to;
+    }
+    return list;
+  }
+
   async function enumeratePool(C, cs) {
     const t0 = performance.now();
-    const prev = (POOL && POOL.C === C) ? { nextId: POOL.nextId, ids: POOL.list.map(x => x.id) } : loadCache(C);
-    let list = null, mode = 'full', chk = null;
+    let list = null, mode = 'reader', chk = null;
 
-    // Fast path: re-read every previously active id + every id created since, at this block.
+    try {
+      list = await readerScan(C, cs);
+      chk = checkPool(list, cs);
+      if (!chk.ok) list = null;
+    } catch (e) { list = null; }
+    if (list) {
+      const p = { C, block: cs.blockNum, nextId: cs.nextId, list, chk, mode, ms: performance.now() - t0, at: Date.now() };
+      saveCache(p);
+      return p;
+    }
+
+    // Fallback: Multicall3 over slotToListing / listings.
+    const prev = (POOL && POOL.C === C) ? { nextId: POOL.nextId, ids: POOL.list.map(x => x.id) } : loadCache(C);
+    mode = 'full';
+    // Re-read every previously active id + every id created since, at this block.
     if (prev && prev.ids.length) {
       const cand = prev.ids.slice();
       for (let id = prev.nextId; id < cs.nextId; id++) cand.push(BigInt(id));
@@ -571,7 +622,15 @@
   #fwaP.min .tabs,#fwaP.min .bd,#fwaP.min .ft{display:none}
   `;
 
-  let TAB = 0, ROUTE = 'eth', LAST = null, timer = null, busy = false, MULTI = { key: null, rows: null };
+  const PREF_KEY = 'fwaOddsPanel.prefs';
+  const prefs = (() => { try { return JSON.parse(localStorage.getItem(PREF_KEY) || '{}'); } catch (e) { return {}; } })();
+  const savePrefs = () => { try { localStorage.setItem(PREF_KEY, JSON.stringify({ tab: TAB, route: ROUTE })); } catch (e) {} };
+  const REFRESH_MS = 60000;
+
+  // Opens on the tier distribution by default; remembers the last tab and route.
+  let TAB = Number.isInteger(prefs.tab) && prefs.tab >= 0 && prefs.tab < S.tabs.length ? prefs.tab : 1;
+  let ROUTE = prefs.route === 'fwa' ? 'fwa' : 'eth';
+  let LAST = null, timer = null, busy = false, MULTI = { key: null, rows: null }, lastOk = 0, renderedTab = -1;
 
   function el(html) { const d = document.createElement('div'); d.innerHTML = html.trim(); return d.firstChild; }
   const sign = x => (x >= 0 ? '+' : '') + F(x, 5);
@@ -721,8 +780,12 @@
       <div class="note">${S.readOnly}</div>`;
     }
 
+    // Keep the reader's place: a background refresh must not jump the view back to the top.
+    const keep = renderedTab === TAB ? bd.scrollTop : 0;
     bd.innerHTML = h;
-    bd.querySelectorAll('[data-route]').forEach(b => b.onclick = () => { ROUTE = b.dataset.route; render(); });
+    bd.scrollTop = keep;
+    renderedTab = TAB;
+    bd.querySelectorAll('[data-route]').forEach(b => b.onclick = () => { ROUTE = b.dataset.route; savePrefs(); render(); });
   }
 
   /* ══════════════ main loop ══════════════ */
@@ -736,27 +799,40 @@
       onProgress(S.progState);
       const gs = await fetchConfig();
       const C = contractOf(gs);
-      let cs = await chainSummary(C);
+      const cs = await chainSummary(C);
       let gasWei = 0;
       try { gasWei = parseInt(await rpc('eth_gasPrice'), 16); } catch (e) {}
 
-      // 1) show aggregates right away
-      let c = compute(gs, cs, null, gasWei);
-      LAST = { c, tests: selfTests(c) };
-      render();
+      // First load only: show the aggregates while the pool is read. On later refreshes the
+      // previous verified view stays on screen until the new one is ready — no flicker.
+      const hadPool = !!(LAST && LAST.c && LAST.c.pool);
+      if (!hadPool) {
+        const c0 = compute(gs, cs, null, gasWei);
+        LAST = { c: c0, tests: selfTests(c0) };
+        render();
+      }
 
-      // 2) enumerate the pool at the same block, then redraw with the distribution
-      POOL = await enumeratePool(C, cs);
-      c = compute(gs, cs, POOL, gasWei);
-      LAST = { c, tests: selfTests(c) };
-      render();
-      onProgress(S.updated(new Date().toLocaleTimeString(), cs.blockNum, POOL));
+      const pool = await enumeratePool(C, cs);
+      POOL = pool;
+      const c = compute(gs, cs, pool, gasWei);
+      if (c.pool || !hadPool) {
+        LAST = { c, tests: selfTests(c) };
+        render();
+      }
+      if (c.pool) lastOk = Date.now();
+      onProgress(c.pool ? S.updated(new Date().toLocaleTimeString(), cs.blockNum, pool)
+                        : S.poolFailShort);
     } catch (e) {
-      if (!LAST || !LAST.c) LAST = { err: String(e && e.message || e) };
-      render();
+      if (!LAST || !LAST.c) { LAST = { err: String(e && e.message || e) }; render(); }
       onProgress(S.errShort + ': ' + String(e && e.message || e).slice(0, 80));
     } finally { busy = false; }
   }
+
+  // Auto-refresh only while the tab is visible; catch up as soon as it comes back.
+  function tick() { if (!document.hidden) refresh(); }
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden && Date.now() - lastOk > REFRESH_MS) refresh();
+  });
 
   function mount() {
     const style = document.createElement('style');
@@ -766,7 +842,7 @@
     const p = el(`<div id="fwaP">
       <div class="hd"><b>${S.title}</b><span class="sp"></span>
         <button class="mn">—</button><button class="rf">${S.refresh}</button><button class="cl">×</button></div>
-      <div class="tabs">${S.tabs.map((t, i) => `<div class="${i === 0 ? 'on' : ''}">${t}</div>`).join('')}</div>
+      <div class="tabs">${S.tabs.map((t, i) => `<div class="${i === TAB ? 'on' : ''}">${t}</div>`).join('')}</div>
       <div class="bd"><div class="note">${S.starting}</div></div>
       <div class="ft"><span class="st">${S.starting}</span><span>v${VERSION}</span></div>
     </div>`);
@@ -774,7 +850,7 @@
 
     const tabs = [...p.querySelectorAll('.tabs div')];
     tabs.forEach((t, i) => t.onclick = () => {
-      TAB = i; tabs.forEach(x => x.classList.remove('on')); t.classList.add('on'); render();
+      TAB = i; tabs.forEach(x => x.classList.remove('on')); t.classList.add('on'); savePrefs(); render();
     });
     p.querySelector('.rf').onclick = refresh;
     p.querySelector('.mn').onclick = () => p.classList.toggle('min');
@@ -800,7 +876,7 @@
 
     window.__fwaPanel = { refresh, state: () => LAST };
     refresh();
-    timer = setInterval(refresh, 60000);
+    timer = setInterval(tick, REFRESH_MS);
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', mount);
